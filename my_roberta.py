@@ -39,8 +39,10 @@ logfile = './outputs/logs/' + MODEL_NAME + '_log_' + start_time_str + '.log'
 log_format = logging.Formatter(fmt='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                                    datefmt='%m/%d/%Y %H:%M:%S')
 logger = logging.getLogger()
+logging.basicConfig(level=logging.DEBUG)
 file_handler = logging.FileHandler(logfile)
-file_handler.setLevel(logging.NOTSET)
+file_handler.setLevel(level=logging.INFO)
+file_handler.setFormatter(log_format)
 logger.addHandler(file_handler)
 
 #################################################################
@@ -449,9 +451,9 @@ if not LOAD_MODEL_FROM:
         gc.collect()
         if result['f1'] >= max_acc:
             max_acc = result['f1']
-            torch.save(model.state_dict(), f'/home/zhr/GAIIC_track2_baseline/outputs/{MODEL_NAME}_v{VER}_{max_acc}.pt')
+            torch.save(model.state_dict(), f'/home/zhr/JDNER/outputs/{MODEL_NAME}_v{VER}_{max_acc}.pt')
         torch.save(model.state_dict(),
-                   f'/home/zhr/GAIIC_track2_baseline/outputs/{MODEL_NAME}_v{VER}_temporary_{epoch}.pt')
+                   f'/home/zhr/JDNER/outputs/{MODEL_NAME}_v{VER}_temporary_{epoch}.pt')
 else:
     model.load_state_dict(torch.load(f'{LOAD_MODEL_FROM}/longformer-large_temporary_v3_3.pt'))
     print('Model loaded.')
