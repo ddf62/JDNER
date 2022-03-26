@@ -26,8 +26,8 @@ VER = 1
 
 # IF VARIABLE IS NONE, THEN NOTEBOOK TRAINS A NEW MODEL
 # OTHERWISE IT LOADS YOUR PREVIOUSLY TRAINED MODEL
-LOAD_MODEL_FROM = './outputs/'
-LOAD_DATA_FROM ='yes'
+LOAD_MODEL_FROM = None  # './outputs/'
+LOAD_DATA_FROM = None
 # IF FOLLOWING IS NONE, THEN NOTEBOOK
 # USES INTERNET AND DOWNLOADS HUGGINGFACE
 # CONFIG, TOKENIZER, AND MODEL
@@ -52,8 +52,8 @@ logger.addHandler(file_handler)
 config = {'model_name': MODEL_NAME,
           'max_length': 256,
           'train_batch_size': 32,
-          'valid_batch_size': 128,
-          'epochs': 1,
+          'valid_batch_size': 64,
+          'epochs': 20,
           'learning_rate_for_bert': 5e-5,
           'learning_rate_for_others': 3e-3,
           'max_grad_norm': 10,
@@ -217,6 +217,7 @@ class dataset(Dataset):
     def __len__(self):
         return self.len
 
+
 class Collate:
     def __init__(self):
         pass
@@ -228,6 +229,8 @@ class Collate:
         output['labels'] = torch.stack([sample['labels'] for sample in batch])
         output['text'] = [sample['text'] for sample in batch]
         return output
+
+
 #################################################################
 
 
@@ -238,7 +241,7 @@ if LOAD_DATA_FROM is None:
     train_text = read_text('./datasets/JDNER/train.txt')
     train_df = preprocessor(train_text, tokenizer)
     # train_set = dataset(train_df)
-    torch.save(train_df, '/home/yqy/jdner-newbaseline/JDNER/datasets/JDNER/train')
+    torch.save(train_df, '/home/zhr/JDNER/datasets/JDNER/train')
     print("TRAIN Dataset: {}".format(len(train_df)))
 
     # 读取开发集文本
@@ -246,7 +249,7 @@ if LOAD_DATA_FROM is None:
     dev_text = read_text('./datasets/JDNER/dev.txt')
     dev_df = preprocessor(dev_text, tokenizer)
     # dev_set = dataset(dev_df)
-    torch.save(dev_df, '/home/yqy/jdner-newbaseline/JDNER/datasets/JDNER/dev')
+    torch.save(dev_df, '/home/zhr/JDNER/datasets/JDNER/dev')
     print("DEV Dataset: {}".format(len(dev_df)))
 
     # 读取测试集文本
@@ -254,15 +257,15 @@ if LOAD_DATA_FROM is None:
     test_text = read_test_text('./datasets/JDNER/test.txt')
     test_df = preprocessor(test_text, tokenizer)
     # test_set = dataset(test_df)
-    torch.save(test_df, '/home/yqy/jdner-newbaseline/JDNER/datasets/JDNER/test')
+    torch.save(test_df, '/home/zhr/JDNER/datasets/JDNER/test')
     print("TEST Dataset: {}".format(len(test_df)))
 
-train_set = dataset(torch.load('/home/yqy/jdner-newbaseline/JDNER/datasets/JDNER/train'))
-dev_set = dataset(torch.load('/home/yqy/jdner-newbaseline/JDNER/datasets/JDNER/dev'))
-test_set = dataset(torch.load('/home/yqy/jdner-newbaseline/JDNER/datasets/JDNER/test'))
-#train_set = dataset(train_df)
-#dev_set = dataset(dev_df)
-#test_set = dataset(test_df)
+train_set = dataset(torch.load('/datasets/JDNER/train'))
+dev_set = dataset(torch.load('./datasets/JDNER/dev'))
+test_set = dataset(torch.load('./datasets/JDNER/test'))
+# train_set = dataset(train_df)
+# dev_set = dataset(dev_df)
+# test_set = dataset(test_df)
 # 生成dataloader
 train_params = {'batch_size': config['train_batch_size'],
                 'shuffle': True,
@@ -272,7 +275,7 @@ train_params = {'batch_size': config['train_batch_size'],
 
 test_params = {'batch_size': config['valid_batch_size'],
                'shuffle': False,
-               'num_workers': 12,
+               'num_workers': 8,
                'pin_memory': True
                }
 collate = Collate()
@@ -484,7 +487,8 @@ def valid(prefix=""):
     avg_recall = total_recall / (len(dev_dataloader))
     avg_loss = loss / len(dev_dataloader)
     print("******************************************")
-    logger.info({"train_precision": avg_precision, "train_recall": avg_recall, "train_f1": avg_f1, 'train_loss': avg_loss})
+    logger.info(
+        {"train_precision": avg_precision, "train_recall": avg_recall, "train_f1": avg_f1, 'train_loss': avg_loss})
     total_f1, total_precision, total_recall = 0., 0., 0.
     loss = 0
     with torch.no_grad():
@@ -503,7 +507,8 @@ def valid(prefix=""):
     avg_recall = total_recall / (len(dev_dataloader))
     avg_loss = loss / len(dev_dataloader)
     print("******************************************")
-    logger.info({"valid_precision": avg_precision, "valid_recall": avg_recall, "valid_f1": avg_f1, 'avg_loss': avg_loss})
+    logger.info(
+        {"valid_precision": avg_precision, "valid_recall": avg_recall, "valid_f1": avg_f1, 'avg_loss': avg_loss})
     return avg_f1
 
 
@@ -517,19 +522,17 @@ if not LOAD_MODEL_FROM:
         print(f'### LR_bert = {lr1}\n### LR_Linear = {lr2}\n')
         train()
         torch.save(model.state_dict(),
-                   f'/home/yqy/jdner-newbaseline/JDNER/outputs/{MODEL_NAME}_v{VER}_temporary_{epoch}.pt')
+                   f'/home/zhr/JDNER/outputs/{MODEL_NAME}_v{VER}_temporary_{epoch}.pt')
         result = valid()
-        torch.cuda.empty_cache()
-        # gc释放内存
-        gc.collect()
         if result >= max_acc:
             max_acc = result
-            torch.save(model.state_dict(), f'/home/yqy/jdner-newbaseline/JDNER/outputs/{MODEL_NAME}_v{VER}_{max_acc}.pt')
+            torch.save(model.state_dict(),
+                       f'/home/zhr/JDNER/outputs/{MODEL_NAME}_v{VER}_{max_acc}.pt')
 
 else:
     model.load_state_dict(torch.load(f'{LOAD_MODEL_FROM}/bert_base_chinese_v1_temporary_0.pt'))
     print('Model loaded.')
-    #valid()
+    # valid()
 
 
 ##################################################################################
@@ -537,21 +540,17 @@ else:
 def decode_ent(text, pred_matrix, threshold=0):
     # print(text)
     ent_list = {}
-    if tokenizer.pad_token in text:
-        length = text.index(tokenizer.pad_token)
-    else:
-        lenght = len(text)
+    length = len(text)
     for ent_type_id, token_start_index, toekn_end_index in zip(*np.where(pred_matrix > threshold)):
         ent_type = ids_to_labels[ent_type_id]
-        ent_char_span = [token_start_index, toekn_end_index]
-        ent_text = text[ent_char_span[0]:ent_char_span[1]]
-        if ent_char_span[0] >= length:
-            continue
-        if ent_char_span[0] == 0:
-            ent_char_span[0] = 1
-        if ent_char_span[1] >= length:
-            ent_char_span[1] = length- 1
+        ent_char_span = [token_start_index - 1, toekn_end_index - 1]
 
+        if ent_char_span[0] >= length + 1:
+            continue
+        if ent_char_span[0] == -1:
+            ent_char_span[0] = 0
+        if ent_char_span[1] >= length + 1:
+            ent_char_span[1] = length - 1
 
         ent_type_dict = ent_list.get(ent_type, [])
         ent_type_dict.append(ent_char_span)
@@ -570,15 +569,28 @@ def predict():
             tr_logits = model(ids, mask)
             preds = tr_logits.detach().cpu().numpy()
             for i in range(len(preds)):
+                if '[SEP]' in text[i]:
+                    length = text[i].index('[PAD]')
+                else:
+                    lenght = len(text[i])
+                text[i] = text[i][1:length]
                 labels = decode_ent(text[i], preds[i])
                 index = 0
                 for key in labels.keys():
                     for span in labels[key]:
                         for index in range(span[0], span[1] + 1):
-                            text[i][index] = text[i][index] + ' ' + 'I-' + key + '\n'
-                        text[i][span[0]] = text[i][span[0]] + ' ' + 'B-' + key + '\n'
+                            if key == 'O':
+                                text[i][index] = text[i][index] + ' ' + 'I-' + key
+                            else:
+                                text[i][index] = text[i][index] + ' ' + 'I-' + key
+                        if key != 'O':
+                            text[i][span[0]] = text[i][span[0]] + ' ' + 'B-' + key
+
                 for jk in range(len(text[i])):
-                    fp.write(text[i][jk])
+                    if len(text[i][jk].split(' ')) == 1 or text[i][jk] == ' ':
+                        fp.write(text[i][jk] + ' O\n')
+                    else:
+                        fp.write(text[i][jk] + '\n')
                 fp.write('\n')
     fp.close()
 
