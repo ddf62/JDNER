@@ -26,16 +26,16 @@ VER = 1
 
 # IF VARIABLE IS NONE, THEN NOTEBOOK TRAINS A NEW MODEL
 # OTHERWISE IT LOADS YOUR PREVIOUSLY TRAINED MODEL
-LOAD_MODEL_FROM = None  # './outputs/'
+LOAD_MODEL_FROM = None#'./outputs/'
 LOAD_DATA_FROM = None
 # IF FOLLOWING IS NONE, THEN NOTEBOOK
 # USES INTERNET AND DOWNLOADS HUGGINGFACE
 # CONFIG, TOKENIZER, AND MODEL
-DOWNLOADED_MODEL_PATH = './prev_trained_model/bert-base-chinese'
+DOWNLOADED_MODEL_PATH = 'nghuyong/ernie-2.0-en'
 
 if DOWNLOADED_MODEL_PATH is None:
     DOWNLOADED_MODEL_PATH = 'model'
-MODEL_NAME = 'bert_base_chinese'
+MODEL_NAME = 'ernie-2.0-en'
 OUTPUT_EVAL_FILE = os.path.join('./outputs/logs', 'eval_results_' + start_time_str + '.txt')
 logfile = './outputs/logs/' + MODEL_NAME + '_log_' + start_time_str + '.log'
 log_format = logging.Formatter(fmt='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
@@ -51,13 +51,14 @@ logger.addHandler(file_handler)
 # config
 config = {'model_name': MODEL_NAME,
           'max_length': 256,
-          'train_batch_size': 32,
-          'valid_batch_size': 64,
-          'epochs': 20,
+          'train_batch_size': 128,
+          'valid_batch_size': 128,
+          'epochs': 30,
           'learning_rate_for_bert': 5e-5,
-          'learning_rate_for_others': 3e-3,
+          'learning_rate_for_others': 5e-4,
           'max_grad_norm': 10,
           'device': 'cuda' if cuda.is_available() else 'cpu'}
+
 
 # THIS WILL COMPUTE VAL SCORE DURING COMMIT BUT NOT DURING SUBMIT
 COMPUTE_VAL_SCORE = True
@@ -67,7 +68,7 @@ COMPUTE_VAL_SCORE = True
 # LOAD_TOKENS_FROM 为存储ner标签csv的路径，处理一次，以后就不用处理了
 # Ner标签采用BIO标记法
 # CREATE DICTIONARIES THAT WE CAN USE DURING TRAIN AND INFER
-output_labels = ['O', '1', '2', '3', '4', '5', '6',
+output_labels = ['1', '2', '3', '4', '5', '6',
                  '7', '8', '9', '10', '11', '12', '13',
                  '14', '15', '16', '17', '18', '19',
                  '20', '21', '22', '23', '24', '25', '26',
@@ -125,7 +126,10 @@ def read_text(input_file):
                     labels = []
             else:
                 splits = line.split(" ")
-                words.append(splits[0])
+                if splits[0] == '':
+                    words.append(' ')
+                else:
+                    words.append(splits[0].lower())
                 if len(splits) > 1:
                     labels.append(splits[-1].replace("\n", ""))
                 else:
@@ -149,7 +153,10 @@ def read_test_text(input_file):
                     labels = []
             else:
                 splits = line.split(" ")
-                words.append(splits[0])
+                if splits[0] == '':
+                    words.append(' ')
+                else:
+                    words.append(splits[0].lower())
                 if len(splits) > 1 and line != ' ':
                     labels.append(splits[-1].replace("\n", ""))
                 else:
@@ -172,18 +179,18 @@ def preprocessor(df, tokenizer):
         text = data['words']
         word_labels = data['labels']
         # TOKENIZE TEXT：生成input_ids, input_mask
-        text_t = [cls] + text + [sep] + [pad] * (config['max_length'] - len(text) - 2)
+        text_t = [cls] + text + [sep]
         '''
         labels = np.zeros((len(output_labels), config['max_length'], config['max_length']))
         for ent, start, end in word_labels:
             labels[labels_to_ids[ent], start, end] = 1
         '''
         input_ids = tokenizer.convert_tokens_to_ids(text_t)
-        input_mask = [1] * (len(text) + 2) + [0] * (config['max_length'] - len(text) - 2)
+        input_mask = [1] * (len(text) + 2)
         # CONVERT TO TORCH TENSORS
         df[index] = {'input_ids': input_ids,
                      'attention_mask': input_mask,
-                     'labels': word_labels, 'text': text_t}
+                     'labels': word_labels}
     return df
 
 
@@ -202,33 +209,40 @@ class dataset(Dataset):
 
     def __getitem__(self, index):
         # GET TEXT AND WORD LABEL
-        output = {}
         set = self.data[index]
-        output["input_ids"] = torch.tensor(set["input_ids"], dtype=torch.long)
-        output["attention_mask"] = torch.tensor(set["attention_mask"], dtype=torch.long)
+        input_ids = torch.tensor(set["input_ids"], dtype=torch.long)
+        attention_mask = torch.tensor(set["attention_mask"], dtype=torch.long)
         labels = np.zeros((len(output_labels), config['max_length'], config['max_length']))
         for ent, start, end in set['labels']:
-            labels[labels_to_ids[ent], start, end] = 1
-        output["labels"] = torch.tensor(labels.tolist(), dtype=torch.long)
-        output['text'] = set['text']
+            labels[labels_to_ids[ent], start + 1, end + 1] = 1
+        labels = torch.tensor(labels, dtype=torch.long)
 
-        return output
+        return self.data[index]
 
     def __len__(self):
         return self.len
 
 
 class Collate:
-    def __init__(self):
-        pass
+    def __init__(self, tokenizer):
+       self.tokenizer = tokenizer
 
     def __call__(self, batch):
-        output = dict()
-        output['input_ids'] = torch.stack([sample['input_ids'] for sample in batch])
-        output['attention_mask'] = torch.stack([sample['attention_mask'] for sample in batch])
-        output['labels'] = torch.stack([sample['labels'] for sample in batch])
-        output['text'] = [sample['text'] for sample in batch]
-        return output
+        input_ids = [sample['input_ids'] for sample in batch]
+        attention_mask = [sample["attention_mask"] for sample in batch]
+        maxlen = max([len(idx) for idx in input_ids])
+        labels = np.zeros((len(batch), len(output_labels), maxlen, maxlen))
+        for sample in range(len(batch)):
+            for ent, start, end in batch[sample]['labels']:
+                labels[sample, labels_to_ids[ent], start + 1, end + 1] = 1
+        # 补全
+        input_ids = [s + [self.tokenizer.pad_token_id] * (maxlen - len(s)) for s in input_ids]
+        attention_mask = [s + [0] * (maxlen - len(s)) for s in attention_mask]
+
+        labels = torch.tensor(labels, dtype=torch.long)
+        input_ids = torch.tensor(input_ids, dtype=torch.long)
+        attention_mask = torch.tensor(attention_mask, dtype=torch.long)
+        return input_ids, attention_mask, labels
 
 
 #################################################################
@@ -260,28 +274,29 @@ if LOAD_DATA_FROM is None:
     torch.save(test_df, '/home/zhr/JDNER/datasets/JDNER/test')
     print("TEST Dataset: {}".format(len(test_df)))
 
-train_set = dataset(torch.load('/datasets/JDNER/train'))
+train_set = dataset(torch.load('./datasets/JDNER/train'))
 dev_set = dataset(torch.load('./datasets/JDNER/dev'))
-test_set = dataset(torch.load('./datasets/JDNER/test'))
+
 # train_set = dataset(train_df)
 # dev_set = dataset(dev_df)
 # test_set = dataset(test_df)
 # 生成dataloader
 train_params = {'batch_size': config['train_batch_size'],
                 'shuffle': True,
-                'num_workers': 8,
+                'num_workers': 6,
                 'pin_memory': True
                 }
 
 test_params = {'batch_size': config['valid_batch_size'],
                'shuffle': False,
-               'num_workers': 8,
+               'num_workers': 6,
                'pin_memory': True
                }
-collate = Collate()
+collate = Collate(tokenizer)
 train_dataloader = DataLoader(train_set, **train_params, collate_fn=collate)
 dev_dataloader = DataLoader(dev_set, **test_params, collate_fn=collate)
-test_dataloader = DataLoader(test_set, **test_params, collate_fn=collate)
+
+
 
 
 #########################################################################
@@ -295,7 +310,10 @@ class GlobalPointer(nn.Module):
         self.ent_type_size = ent_type_size
         self.inner_dim = inner_dim
         self.hidden_size = hidden_size
-        self.dense = nn.Linear(self.hidden_size, self.ent_type_size * self.inner_dim * 2)
+        self.dense = nn.Sequential(
+            nn.Dropout(p=0.22),
+            nn.Linear(self.hidden_size, self.ent_type_size * self.inner_dim * 2)
+        )
 
         self.RoPE = RoPE
 
@@ -360,17 +378,22 @@ class GlobalPointer(nn.Module):
 
 
 model = GlobalPointer(model_path=DOWNLOADED_MODEL_PATH, ent_type_size=len(output_labels), inner_dim=64)
-optimizer = torch.optim.Adam([{'params': model.mdoel.parameters(), 'lr': config['learning_rate_for_bert']},
-                              {'params': model.dense.parameters()}], lr=config['learning_rate_for_others'])
+optimizer = torch.optim.AdamW([{'params': model.mdoel.parameters(), 'lr': config['learning_rate_for_bert']},
+                              {'params': model.dense.parameters(), 'lr': config['learning_rate_for_others']}])
 num_batches = len(train_dataloader) / config['train_batch_size']
 total_train_steps = int(num_batches * config['epochs'])
 warmup_steps = int(0.2 * total_train_steps)
+'''
 sched = get_polynomial_decay_schedule_with_warmup(optimizer,
                                                   num_warmup_steps=warmup_steps,
                                                   num_training_steps=total_train_steps,
                                                   lr_end=2e-5,
                                                   power=2
                                                   )
+                                                  '''
+sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer,
+                                                             len(train_dataloader)*2,
+                                                             1)
 
 model.to(config['device'])
 
@@ -431,14 +454,12 @@ def train():
     # tr_preds, tr_labels = [], []
     # put model in training mode
     model.train()
-    pred = []
-    label = []
     n = 0
     with tqdm(total=len(train_dataloader), desc="Train") as pbar:
         for idx, batch in enumerate(train_dataloader):
-            ids = batch['input_ids'].to(config['device'], dtype=torch.long)
-            mask = batch['attention_mask'].to(config['device'], dtype=torch.long)
-            labels = batch['labels'].to(config['device'], dtype=torch.long)
+            ids = batch[0].to(config['device'], dtype=torch.long)
+            mask = batch[1].to(config['device'], dtype=torch.long)
+            labels = batch[2].to(config['device'], dtype=torch.long)
 
             tr_logits = model(ids, mask)
 
@@ -469,44 +490,47 @@ def train():
 
 def valid(prefix=""):
     model.eval()
+
     total_f1, total_precision, total_recall = 0., 0., 0.
     loss = 0
     with torch.no_grad():
         for batch in tqdm(train_dataloader):
-            ids = batch['input_ids'].to(config['device'], dtype=torch.long)
-            mask = batch['attention_mask'].to(config['device'], dtype=torch.long)
-            labels = batch['labels'].to(config['device'], dtype=torch.long)
+            ids = batch[0].to(config['device'], dtype=torch.long)
+            mask = batch[1].to(config['device'], dtype=torch.long)
+            labels = batch[2].to(config['device'], dtype=torch.long)
             logits = model(ids, mask)
             loss += loss_fun(labels, logits)
             f1, precession, recall = get_evaluate_fpr(logits, labels)
             total_f1 += f1
             total_precision += precession
-            total_recall += total_recall
-    avg_f1 = total_f1 / (len(dev_dataloader))
-    avg_precision = total_precision / (len(dev_dataloader))
-    avg_recall = total_recall / (len(dev_dataloader))
-    avg_loss = loss / len(dev_dataloader)
-    print("******************************************")
+            total_recall += recall
+    avg_f1 = total_f1 / (len(train_dataloader))
+    avg_precision = total_precision / (len(train_dataloader))
+    avg_recall = total_recall / (len(train_dataloader))
+    avg_loss = loss / len(train_dataloader)
+    
+    logger.info("******************************************")
     logger.info(
         {"train_precision": avg_precision, "train_recall": avg_recall, "train_f1": avg_f1, 'train_loss': avg_loss})
+
     total_f1, total_precision, total_recall = 0., 0., 0.
     loss = 0
     with torch.no_grad():
         for batch in tqdm(dev_dataloader):
-            ids = batch['input_ids'].to(config['device'], dtype=torch.long)
-            mask = batch['attention_mask'].to(config['device'], dtype=torch.long)
-            labels = batch['labels'].to(config['device'], dtype=torch.long)
+            ids = batch[0].to(config['device'], dtype=torch.long)
+            mask = batch[1].to(config['device'], dtype=torch.long)
+            labels = batch[2].to(config['device'], dtype=torch.long)
             logits = model(ids, mask)
             loss += loss_fun(labels, logits)
             f1, precession, recall = get_evaluate_fpr(logits, labels)
             total_f1 += f1
             total_precision += precession
-            total_recall += total_recall
+            total_recall += recall
     avg_f1 = total_f1 / (len(dev_dataloader))
     avg_precision = total_precision / (len(dev_dataloader))
     avg_recall = total_recall / (len(dev_dataloader))
     avg_loss = loss / len(dev_dataloader)
-    print("******************************************")
+    logger.info("******************************************")
     logger.info(
         {"valid_precision": avg_precision, "valid_recall": avg_recall, "valid_f1": avg_f1, 'avg_loss': avg_loss})
     return avg_f1
@@ -516,26 +540,30 @@ if not LOAD_MODEL_FROM:
     max_acc = 0
     for epoch in range(config['epochs']):
 
-        print(f"### Training epoch: {epoch + 1}")
+        logger.info(f"### Training epoch: {epoch + 1}")
         lr1 = optimizer.param_groups[0]['lr']
         lr2 = optimizer.param_groups[-1]['lr']
-        print(f'### LR_bert = {lr1}\n### LR_Linear = {lr2}\n')
+        logger.info(f'### LR_bert = {lr1}\n### LR_Linear = {lr2}\n')
         train()
-        torch.save(model.state_dict(),
-                   f'/home/zhr/JDNER/outputs/{MODEL_NAME}_v{VER}_temporary_{epoch}.pt')
+        if epoch > 5:
+            torch.save(model.state_dict(),
+                   f'/home/zhr/JDNER/outputs/{MODEL_NAME}_v{VER}_temporary_{epoch+1}.pt')
         result = valid()
         if result >= max_acc:
             max_acc = result
             torch.save(model.state_dict(),
                        f'/home/zhr/JDNER/outputs/{MODEL_NAME}_v{VER}_{max_acc}.pt')
+        gc.collect()
 
 else:
-    model.load_state_dict(torch.load(f'{LOAD_MODEL_FROM}/bert_base_chinese_v1_temporary_0.pt'))
+    model.load_state_dict(torch.load(f'{LOAD_MODEL_FROM}/bert_base_chinese_v1_0.25288123172571325.pt'))
     print('Model loaded.')
     # valid()
 
 
 ##################################################################################
+test_set = dataset(torch.load('./datasets/JDNER/test'))
+test_dataloader = DataLoader(test_set, **test_params, collate_fn=collate)
 # 推理
 def decode_ent(text, pred_matrix, threshold=0):
     # print(text)
@@ -560,38 +588,35 @@ def decode_ent(text, pred_matrix, threshold=0):
 
 
 def predict():
+    test_text = read_test_text('./datasets/JDNER/test.txt')
     fp = open('test_prediction.txt', 'w')
+    tmp = 0
     with torch.no_grad():
         for batch in tqdm(test_dataloader):
-            ids = batch['input_ids'].to(config['device'], dtype=torch.long)
-            mask = batch['attention_mask'].to(config['device'], dtype=torch.long)
-            text = batch['text']
+            ids = batch[0].to(config['device'], dtype=torch.long)
+            mask = batch[1].to(config['device'], dtype=torch.long)
             tr_logits = model(ids, mask)
             preds = tr_logits.detach().cpu().numpy()
             for i in range(len(preds)):
-                if '[SEP]' in text[i]:
-                    length = text[i].index('[PAD]')
-                else:
-                    lenght = len(text[i])
-                text[i] = text[i][1:length]
-                labels = decode_ent(text[i], preds[i])
+                labels = decode_ent(test_text[tmp]['words'], preds[i])
                 index = 0
                 for key in labels.keys():
                     for span in labels[key]:
                         for index in range(span[0], span[1] + 1):
                             if key == 'O':
-                                text[i][index] = text[i][index] + ' ' + 'I-' + key
+                                test_text[tmp]['words'][index] = test_text[tmp]['words'][index] + ' ' + 'I-' + key
                             else:
-                                text[i][index] = text[i][index] + ' ' + 'I-' + key
+                                test_text[tmp]['words'][index] = test_text[tmp]['words'][index] + ' ' + 'I-' + key
                         if key != 'O':
-                            text[i][span[0]] = text[i][span[0]] + ' ' + 'B-' + key
+                            test_text[tmp]['words'][span[0]] = test_text[tmp]['words'][span[0]] + ' ' + 'B-' + key
 
-                for jk in range(len(text[i])):
-                    if len(text[i][jk].split(' ')) == 1 or text[i][jk] == ' ':
-                        fp.write(text[i][jk] + ' O\n')
+                for jk in range(len(test_text[tmp]['words'])):
+                    if len(test_text[tmp]['words'][jk].split(' ')) == 1 or test_text[tmp]['words'][jk] == ' ':
+                        fp.write(test_text[tmp]['words'][jk] + ' O\n')
                     else:
-                        fp.write(text[i][jk] + '\n')
+                        fp.write(test_text[tmp]['words'][jk] + '\n')
                 fp.write('\n')
+                tmp += 1
     fp.close()
 
 
