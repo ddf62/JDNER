@@ -12,13 +12,15 @@ import pandas as pd
 import torch
 from sklearn.metrics import accuracy_score
 from torch.utils.data import DataLoader, Dataset
-from torch import nn
+from torch import kl_div, nn
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModel, get_polynomial_decay_schedule_with_warmup, AutoConfig
+from transformers import AutoModelForMaskedLM, AutoTokenizer, AutoModel, get_polynomial_decay_schedule_with_warmup, \
+    AutoConfig
 from torch import cuda
+from tools.utils import FGM, ConditionalLayerNorm
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # 0,1,2,3 for four gpu
-
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 start_time = time.localtime(time.time())
 start_time_str = f'{start_time[1]}-{start_time[2]}-{start_time[3]}:{start_time[4]}'
 # VERSION FOR SAVING MODEL WEIGHTS
@@ -26,40 +28,49 @@ VER = 1
 
 # IF VARIABLE IS NONE, THEN NOTEBOOK TRAINS A NEW MODEL
 # OTHERWISE IT LOADS YOUR PREVIOUSLY TRAINED MODEL
-LOAD_MODEL_FROM = None#'./outputs/'
+LOAD_MODEL_FROM = None  # './outputs/'
 LOAD_DATA_FROM = None
 # IF FOLLOWING IS NONE, THEN NOTEBOOK
 # USES INTERNET AND DOWNLOADS HUGGINGFACE
 # CONFIG, TOKENIZER, AND MODEL
-DOWNLOADED_MODEL_PATH = 'nghuyong/ernie-2.0-en'
+DOWNLOADED_MODEL_PATH = './prev_trained_model/uer-large-token'
 
 if DOWNLOADED_MODEL_PATH is None:
     DOWNLOADED_MODEL_PATH = 'model'
-MODEL_NAME = 'ernie-2.0-en'
-OUTPUT_EVAL_FILE = os.path.join('./outputs/logs', 'eval_results_' + start_time_str + '.txt')
-logfile = './outputs/logs/' + MODEL_NAME + '_log_' + start_time_str + '.log'
+MODEL_NAME = 'uer-large-token-block-token_fgm-dropout-wei-B'
 log_format = logging.Formatter(fmt='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                                datefmt='%m/%d/%Y %H:%M:%S')
 logger = logging.getLogger()
-logging.basicConfig(level=logging.DEBUG)
-file_handler = logging.FileHandler(logfile)
-file_handler.setLevel(level=logging.INFO)
-file_handler.setFormatter(log_format)
-logger.addHandler(file_handler)
 
+if LOAD_MODEL_FROM is None:
+    logfile = './outputs/logs/' + MODEL_NAME + '_log_' + start_time_str + '.log'
+
+    logging.basicConfig(level=logging.DEBUG)
+    file_handler = logging.FileHandler(logfile)
+    file_handler.setLevel(level=logging.INFO)
+    file_handler.setFormatter(log_format)
+    logger.addHandler(file_handler)
+    logger.info(MODEL_NAME)
+
+torch.set_printoptions(threshold=np.inf)
+logger.info('修改了梯度裁剪位置')
 #################################################################
 # config
 config = {'model_name': MODEL_NAME,
           'max_length': 256,
-          'train_batch_size': 128,
-          'valid_batch_size': 128,
-          'epochs': 30,
+          'train_batch_size': 32,
+          'valid_batch_size': 64,
+          'epochs': 8,
           'learning_rate_for_bert': 5e-5,
-          'learning_rate_for_others': 5e-4,
+          'learning_rate_for_others': 2e-3,
+          'weight_decay': 1e-6,
+          'epsilon': 0.5,
           'max_grad_norm': 10,
+          'norm': 1,
+          'T_max': 2,
+          'thread': 0.819,
           'device': 'cuda' if cuda.is_available() else 'cpu'}
-
-
+logger.info(config)
 # THIS WILL COMPUTE VAL SCORE DURING COMMIT BUT NOT DURING SUBMIT
 COMPUTE_VAL_SCORE = True
 
@@ -129,7 +140,7 @@ def read_text(input_file):
                 if splits[0] == '':
                     words.append(' ')
                 else:
-                    words.append(splits[0].lower())
+                    words.append(splits[0])
                 if len(splits) > 1:
                     labels.append(splits[-1].replace("\n", ""))
                 else:
@@ -176,7 +187,8 @@ def preprocessor(df, tokenizer):
     # GET TEXT AND WORD LABELS
     for index in tqdm(range(len(df))):
         data = df[index]
-        text = data['words']
+        # text = data['words']
+        text = [i.lower() for i in data['words']]
         word_labels = data['labels']
         # TOKENIZE TEXT：生成input_ids, input_mask
         text_t = [cls] + text + [sep]
@@ -195,7 +207,7 @@ def preprocessor(df, tokenizer):
 
 
 tokenizer = AutoTokenizer.from_pretrained(DOWNLOADED_MODEL_PATH, do_lower_case=True)
-
+tokenizer.add_tokens(' ')
 #########################################################################
 # 定义dataset
 
@@ -209,14 +221,6 @@ class dataset(Dataset):
 
     def __getitem__(self, index):
         # GET TEXT AND WORD LABEL
-        set = self.data[index]
-        input_ids = torch.tensor(set["input_ids"], dtype=torch.long)
-        attention_mask = torch.tensor(set["attention_mask"], dtype=torch.long)
-        labels = np.zeros((len(output_labels), config['max_length'], config['max_length']))
-        for ent, start, end in set['labels']:
-            labels[labels_to_ids[ent], start + 1, end + 1] = 1
-        labels = torch.tensor(labels, dtype=torch.long)
-
         return self.data[index]
 
     def __len__(self):
@@ -225,7 +229,7 @@ class dataset(Dataset):
 
 class Collate:
     def __init__(self, tokenizer):
-       self.tokenizer = tokenizer
+        self.tokenizer = tokenizer
 
     def __call__(self, batch):
         input_ids = [sample['input_ids'] for sample in batch]
@@ -242,40 +246,12 @@ class Collate:
         labels = torch.tensor(labels, dtype=torch.long)
         input_ids = torch.tensor(input_ids, dtype=torch.long)
         attention_mask = torch.tensor(attention_mask, dtype=torch.long)
-        return input_ids, attention_mask, labels
+        seg_id = torch.zeros((len(batch), maxlen))
+        return input_ids, attention_mask, labels, seg_id
 
 
 #################################################################
 
-
-if LOAD_DATA_FROM is None:
-    # 读取训练文件
-
-    print('preprocess train')
-    train_text = read_text('./datasets/JDNER/train.txt')
-    train_df = preprocessor(train_text, tokenizer)
-    # train_set = dataset(train_df)
-    torch.save(train_df, '/home/zhr/JDNER/datasets/JDNER/train')
-    print("TRAIN Dataset: {}".format(len(train_df)))
-
-    # 读取开发集文本
-    print('preprocess dev')
-    dev_text = read_text('./datasets/JDNER/dev.txt')
-    dev_df = preprocessor(dev_text, tokenizer)
-    # dev_set = dataset(dev_df)
-    torch.save(dev_df, '/home/zhr/JDNER/datasets/JDNER/dev')
-    print("DEV Dataset: {}".format(len(dev_df)))
-
-    # 读取测试集文本
-    print('preprocess test')
-    test_text = read_test_text('./datasets/JDNER/test.txt')
-    test_df = preprocessor(test_text, tokenizer)
-    # test_set = dataset(test_df)
-    torch.save(test_df, '/home/zhr/JDNER/datasets/JDNER/test')
-    print("TEST Dataset: {}".format(len(test_df)))
-
-train_set = dataset(torch.load('./datasets/JDNER/train'))
-dev_set = dataset(torch.load('./datasets/JDNER/dev'))
 
 # train_set = dataset(train_df)
 # dev_set = dataset(dev_df)
@@ -293,93 +269,152 @@ test_params = {'batch_size': config['valid_batch_size'],
                'pin_memory': True
                }
 collate = Collate(tokenizer)
-train_dataloader = DataLoader(train_set, **train_params, collate_fn=collate)
-dev_dataloader = DataLoader(dev_set, **test_params, collate_fn=collate)
 
+if LOAD_DATA_FROM is None:
+    # 读取训练文件
 
+    print('preprocess train')
+    train_text = read_text('./datasets/JDNER/train_wei_pro_plus_max_+++.txt')
+    train_df = preprocessor(train_text, tokenizer)
+    train_set = dataset(train_df)
+    print("TRAIN Dataset: {}".format(len(train_df)))
+
+    # 读取开发集文本
+    print('preprocess dev')
+    dev_text = read_text('./datasets/JDNER/dev.txt')
+    dev_df = preprocessor(dev_text, tokenizer)
+    dev_set = dataset(dev_df)
+    print("DEV Dataset: {}".format(len(dev_df)))
+
+    train_dataloader = DataLoader(train_set, **train_params, collate_fn=collate)
+    dev_dataloader = DataLoader(dev_set, **test_params, collate_fn=collate)
 
 
 #########################################################################
 # 模型
+# 模型
+def sequence_masking(x, mask, value='-inf', axis=None):
+    if mask is None:
+        return x
+    else:
+        if value == '-inf':
+            value = -1e12
+        elif value == 'inf':
+            value = 1e12
+        assert axis > 0, 'axis must be greater than 0'
+        for _ in range(axis - 1):
+            mask = torch.unsqueeze(mask, 1)
+        for _ in range(x.ndim - mask.ndim):
+            mask = torch.unsqueeze(mask, mask.ndim)
+        return x * mask + value * (1 - mask)
+
+
+def add_mask_tril(logits, mask):
+    if mask.dtype != logits.dtype:
+        mask = mask.type(logits.dtype)
+    logits = sequence_masking(logits, mask, '-inf', logits.ndim - 2)
+    logits = sequence_masking(logits, mask, '-inf', logits.ndim - 1)
+    # 排除下三角
+    mask = torch.tril(torch.ones_like(logits), diagonal=-1)
+    logits = logits - mask * 1e12
+    return logits
+
 
 class GlobalPointer(nn.Module):
-    def __init__(self, model_path, ent_type_size, inner_dim, RoPE=True, hidden_size=768):
+    def __init__(self, model_path, ent_type_size, inner_dim, hidden_size=1024):
         super().__init__()
-        self.config = AutoConfig.from_pretrained(model_path)
-        self.mdoel = AutoModel.from_config(self.config)
+
+        self.model = AutoModelForMaskedLM.from_pretrained(model_path)
         self.ent_type_size = ent_type_size
         self.inner_dim = inner_dim
         self.hidden_size = hidden_size
+        # self.dense = nn.Linear(self.hidden_size, self.ent_type_size * self.inner_dim * 2)
+
         self.dense = nn.Sequential(
-            nn.Dropout(p=0.22),
+            nn.Dropout(p=0.5),
             nn.Linear(self.hidden_size, self.ent_type_size * self.inner_dim * 2)
         )
 
-        self.RoPE = RoPE
+        # self.type_embedding = nn.Embedding(len(output_labels), 256)
+        # self.condition = ConditionalLayerNorm(1024, 256, eps=1e-12)
 
-    def sinusoidal_position_embedding(self, batch_size, seq_len, output_dim):
-        # [seq_len,1]
-        position_ids = torch.arange(0, seq_len, dtype=torch.float).unsqueeze(-1)
-        # [output_dim/2]
-        indices = torch.arange(0, output_dim // 2, dtype=torch.float)
-        indices = torch.pow(10000, -2 * indices / output_dim)
-        # [seq_len, output_dim/2]
-        embeddings = position_ids * indices
+        self.RoPE = True
+
+    def sinusoidal_position_embedding(self, output_dim, merge_mode, inputs):
+        input_shape = inputs.shape
+        _, seq_len = input_shape[0], input_shape[1]
+        position_ids = torch.arange(seq_len).type(torch.float)[None]
+        indices = torch.arange(output_dim // 2).type(torch.float)
+        indices = torch.pow(10000.0, -2 * indices / output_dim)
+        embeddings = torch.einsum('bn,d->bnd', position_ids, indices)
         embeddings = torch.stack([torch.sin(embeddings), torch.cos(embeddings)], dim=-1)
-        # [batch_size, seq_length, output_dim/2, 2]
-        embeddings = embeddings.repeat((batch_size, *([1] * len(embeddings.shape))))
-        embeddings = torch.reshape(embeddings, (batch_size, seq_len, output_dim))
-        embeddings = embeddings.to(config['device'])
+        embeddings = torch.reshape(embeddings, (-1, seq_len, output_dim))
+
+        if merge_mode == 'add':
+            return inputs + embeddings.to(inputs.device)
+        elif merge_mode == 'mul':
+            return inputs * (embeddings + 1.0).to(inputs.device)
+        elif merge_mode == 'zero':
+            return embeddings.to(inputs.device)
         return embeddings
 
-    def forward(self, input_ids, attention_mask):
-        context_outputs = self.mdoel(input_ids, attention_mask)
-        # last_hidden_state:(batch_size, seq_len, hidden_size)
-        last_hidden_state = context_outputs[0]
+    def forward(self, input_ids, attention_mask, seg):
+        outputs = self.model(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=seg,
+            return_dict=True,
+            output_hidden_states=True
+        ).hidden_states
 
+        last_hidden_state = outputs[-1]
         batch_size = last_hidden_state.size()[0]
         seq_len = last_hidden_state.size()[1]
 
-        # outputs:(batch_size, seq_len, ent_type_size*inner_dim*2)
-        outputs = self.dense(last_hidden_state)
-        outputs = torch.split(outputs, self.inner_dim * 2, dim=-1)
-        # outputs:(batch_size, seq_len, ent_type_size, inner_dim*2)
-        outputs = torch.stack(outputs, dim=-2)
-        # qw,kw:(batch_size, seq_len, ent_type_size, inner_dim)
-        qw, kw = outputs[..., :self.inner_dim], outputs[..., self.inner_dim:]  # TODO:修改为Linear获取？
-
+        inputs = self.dense(last_hidden_state)
+        inputs = torch.split(inputs, self.inner_dim * 2, dim=-1)
+        # 按照-1这个维度去分，每块包含x个小块
+        inputs = torch.stack(inputs, dim=-2)
+        # 沿着一个新维度对输入张量序列进行连接。 序列中所有的张量都应该为相同形状
+        qw, kw = inputs[..., :self.inner_dim], inputs[..., self.inner_dim:]
+        # 分出qw和kw
+        # RoPE编码
         if self.RoPE:
-            # pos_emb:(batch_size, seq_len, inner_dim)
-            pos_emb = self.sinusoidal_position_embedding(batch_size, seq_len, self.inner_dim)
-            # cos_pos,sin_pos: (batch_size, seq_len, 1, inner_dim)
-            cos_pos = pos_emb[..., None, 1::2].repeat_interleave(2, dim=-1)
-            sin_pos = pos_emb[..., None, ::2].repeat_interleave(2, dim=-1)
-            qw2 = torch.stack([-qw[..., 1::2], qw[..., ::2]], -1)
-            qw2 = qw2.reshape(qw.shape)
+            pos = self.sinusoidal_position_embedding(self.inner_dim, 'zero', inputs)
+            cos_pos = pos[..., None, 1::2].repeat(1, 1, 1, 2)
+            sin_pos = pos[..., None, ::2].repeat(1, 1, 1, 2)
+            qw2 = torch.stack([-qw[..., 1::2], qw[..., ::2]], 4)
+            qw2 = torch.reshape(qw2, qw.shape)
             qw = qw * cos_pos + qw2 * sin_pos
-            kw2 = torch.stack([-kw[..., 1::2], kw[..., ::2]], -1)
-            kw2 = kw2.reshape(kw.shape)
+            kw2 = torch.stack([-kw[..., 1::2], kw[..., ::2]], 4)
+            kw2 = torch.reshape(kw2, kw.shape)
             kw = kw * cos_pos + kw2 * sin_pos
-
-        # logits:(batch_size, ent_type_size, seq_len, seq_len)
-        logits = torch.einsum('bmhd,bnhd->bhmn', qw, kw)
-
-        # padding mask
-        pad_mask = attention_mask.unsqueeze(1).unsqueeze(1).expand(batch_size, self.ent_type_size, seq_len, seq_len)
+        # 计算内积
+        logits = torch.einsum('bmhd , bnhd -> bhmn', qw, kw)
+        # 排除padding 排除下三角
+        # logits = add_mask_tril(logits, attention_mask)
+        # pad_mask = attention_mask.unsqueeze(1).unsqueeze(1).expand(batch_size, self.ent_type_size, seq_len, seq_len)
         # pad_mask_h = attention_mask.unsqueeze(1).unsqueeze(-1).expand(batch_size, self.ent_type_size, seq_len, seq_len)
         # pad_mask = pad_mask_v&pad_mask_h
-        logits = logits * pad_mask - (1 - pad_mask) * 1e12
+        # logits = logits * pad_mask - (1 - pad_mask) * 1e12
 
         # 排除下三角
-        mask = torch.tril(torch.ones_like(logits), -1)
-        logits = logits - mask * 1e12
-
+        # mask = torch.tril(torch.ones_like(logits), -1)
+        # logits = logits - mask * 1e12
+        logits = add_mask_tril(logits, attention_mask)
+        # scale返回
         return logits / self.inner_dim ** 0.5
 
 
-model = GlobalPointer(model_path=DOWNLOADED_MODEL_PATH, ent_type_size=len(output_labels), inner_dim=64)
-optimizer = torch.optim.AdamW([{'params': model.mdoel.parameters(), 'lr': config['learning_rate_for_bert']},
-                              {'params': model.dense.parameters(), 'lr': config['learning_rate_for_others']}])
+model = GlobalPointer(model_path=DOWNLOADED_MODEL_PATH, ent_type_size=len(output_labels), inner_dim=64,
+                      hidden_size=1024)
+model.model.resize_token_embeddings(len(tokenizer))
+optimizer = torch.optim.AdamW([{'params': model.model.parameters(), 'lr': config['learning_rate_for_bert'],
+                                "weight_decay": config['weight_decay']},
+                               {'params': model.dense.parameters(), 'lr': config['learning_rate_for_others'],
+                                "weight_decay": 0.0}],
+                              eps=1e-6,
+                              )
 num_batches = len(train_dataloader) / config['train_batch_size']
 total_train_steps = int(num_batches * config['epochs'])
 warmup_steps = int(0.2 * total_train_steps)
@@ -390,13 +425,17 @@ sched = get_polynomial_decay_schedule_with_warmup(optimizer,
                                                   lr_end=2e-5,
                                                   power=2
                                                   )
-                                                  '''
+'''
 sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer,
-                                                             len(train_dataloader)*2,
-                                                             1)
+                                                             len(train_dataloader) * config['norm'],
+                                                             config['T_max'])
 
+fgm = FGM(model)
 model.to(config['device'])
+kl_div = nn.KLDivLoss(reduction='batchmean')
 
+
+# model.load_state_dict(torch.load('outputs/uer_large_token_v1_0.8117350654732964.pt'))
 
 def get_evaluate_fpr(y_pred, y_true):
     y_pred = y_pred.detach().cpu().numpy()
@@ -448,6 +487,9 @@ def loss_fun(y_true, y_pred):
     return loss
 
 
+global_step = 0
+
+
 def train():
     tr_loss, tr_accuracy = 0, 0
     nb_tr_examples, nb_tr_steps = 0, 0
@@ -455,37 +497,65 @@ def train():
     # put model in training mode
     model.train()
     n = 0
+    global global_step
     with tqdm(total=len(train_dataloader), desc="Train") as pbar:
         for idx, batch in enumerate(train_dataloader):
             ids = batch[0].to(config['device'], dtype=torch.long)
             mask = batch[1].to(config['device'], dtype=torch.long)
             labels = batch[2].to(config['device'], dtype=torch.long)
+            seg = batch[3].to(config['device'], dtype=torch.long)
 
-            tr_logits = model(ids, mask)
-
+            tr_logits = model(ids, mask, seg)
             loss = loss_fun(labels, tr_logits)
-
             tr_loss += loss.item()
+            # r-drop
+            # tr_logits2 = model(ids, mask, seg)
+            # loss1 = loss_fun(labels, tr_logits)
+            # loss2 = loss_fun(labels, tr_logits2)
+            # print(kl_div(tr_logits.log(), tr_logits2), kl_div(tr_logits2.log(), tr_logits))
+            # kl_loss = (kl_div(tr_logits, tr_logits2).sum(-1) + kl_div(tr_logits2, tr_logits).sum(-1)) / 2
+            # tr_loss += (loss1.item() + loss2.item())/2
+            # loss = (loss1 + loss2) / 2 + kl_loss
 
             nb_tr_steps += 1
             nb_tr_examples += labels.size(0)
 
             # gradient clipping
+
+            n += 1
+            # backward pass
+
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 parameters=model.parameters(), max_norm=config['max_grad_norm']
             )
-            n += 1
-            # backward pass
-            optimizer.zero_grad()
-            loss.backward()
+
+            fgm.attack(epsilon=config['epsilon'], emb_name='bert.embeddings.word_embeddings.weight')
+            logits_adv = model(ids, mask, seg)
+            loss_adv = loss_fun(labels, logits_adv)
+            loss_adv.backward()  # 反向传播，并在正常的grad基础上，累加对抗训练的梯度
+            torch.nn.utils.clip_grad_norm_(
+                parameters=model.parameters(), max_norm=config['max_grad_norm']
+            )
+
+            fgm.restore(emb_name='bert.embeddings.word_embeddings.weight')
+
             optimizer.step()
             sched.step()
-
+            optimizer.zero_grad()
             pbar.set_postfix({'loss': '{0:1.5f}'.format(tr_loss / nb_tr_steps)})
             pbar.update(1)
+            global_step += 1
+            if global_step % 200 == 0:
+                logger.info(f'steps: {global_step}')
+                f1 = valid_dev()
+                if f1 > config['thread']:
+                    torch.save(model.state_dict(),
+                               f'/home/zbg/Reinforcement/强化学习算法2021/JDNER/outputs/{MODEL_NAME}_{global_step}_{f1}.pt')
+                model.train()
 
     epoch_loss = tr_loss / nb_tr_steps
-    print(f"Training loss epoch: {epoch_loss}")
+    logger.info(f"Training loss epoch: {epoch_loss}")
 
 
 def valid(prefix=""):
@@ -498,7 +568,9 @@ def valid(prefix=""):
             ids = batch[0].to(config['device'], dtype=torch.long)
             mask = batch[1].to(config['device'], dtype=torch.long)
             labels = batch[2].to(config['device'], dtype=torch.long)
-            logits = model(ids, mask)
+            seg = batch[3].to(config['device'], dtype=torch.long)
+
+            logits = model(ids, mask, seg)
             loss += loss_fun(labels, logits)
             f1, precession, recall = get_evaluate_fpr(logits, labels)
             total_f1 += f1
@@ -508,7 +580,7 @@ def valid(prefix=""):
     avg_precision = total_precision / (len(train_dataloader))
     avg_recall = total_recall / (len(train_dataloader))
     avg_loss = loss / len(train_dataloader)
-    
+
     logger.info("******************************************")
     logger.info(
         {"train_precision": avg_precision, "train_recall": avg_recall, "train_f1": avg_f1, 'train_loss': avg_loss})
@@ -520,7 +592,9 @@ def valid(prefix=""):
             ids = batch[0].to(config['device'], dtype=torch.long)
             mask = batch[1].to(config['device'], dtype=torch.long)
             labels = batch[2].to(config['device'], dtype=torch.long)
-            logits = model(ids, mask)
+            seg = batch[3].to(config['device'], dtype=torch.long)
+
+            logits = model(ids, mask, seg)
             loss += loss_fun(labels, logits)
             f1, precession, recall = get_evaluate_fpr(logits, labels)
             total_f1 += f1
@@ -533,37 +607,60 @@ def valid(prefix=""):
     logger.info("******************************************")
     logger.info(
         {"valid_precision": avg_precision, "valid_recall": avg_recall, "valid_f1": avg_f1, 'avg_loss': avg_loss})
+    logger.info('\n')
+    return avg_f1
+
+
+def valid_dev():
+    model.eval()
+    total_f1, total_precision, total_recall = 0., 0., 0.
+    loss = 0
+    with torch.no_grad():
+        for batch in tqdm(dev_dataloader):
+            ids = batch[0].to(config['device'], dtype=torch.long)
+            mask = batch[1].to(config['device'], dtype=torch.long)
+            labels = batch[2].to(config['device'], dtype=torch.long)
+            seg = batch[3].to(config['device'], dtype=torch.long)
+
+            logits = model(ids, mask, seg)
+            loss += loss_fun(labels, logits)
+            f1, precession, recall = get_evaluate_fpr(logits, labels)
+            total_f1 += f1
+            total_precision += precession
+            total_recall += recall
+    avg_f1 = total_f1 / (len(dev_dataloader))
+    avg_precision = total_precision / (len(dev_dataloader))
+    avg_recall = total_recall / (len(dev_dataloader))
+    avg_loss = loss / len(dev_dataloader)
+    logger.info("******************************************")
+    logger.info(
+        {"valid_precision": avg_precision, "valid_recall": avg_recall, "valid_f1": avg_f1, 'avg_loss': avg_loss})
+    logger.info('\n')
     return avg_f1
 
 
 if not LOAD_MODEL_FROM:
-    max_acc = 0
+    max_acc = 0.817
     for epoch in range(config['epochs']):
 
         logger.info(f"### Training epoch: {epoch + 1}")
         lr1 = optimizer.param_groups[0]['lr']
         lr2 = optimizer.param_groups[-1]['lr']
-        logger.info(f'### LR_bert = {lr1}\n### LR_Linear = {lr2}\n')
+        logger.info(f'### LR_bert = {lr1}\n### LR_Linear = {lr2}')
         train()
-        if epoch > 5:
-            torch.save(model.state_dict(),
-                   f'/home/zhr/JDNER/outputs/{MODEL_NAME}_v{VER}_temporary_{epoch+1}.pt')
         result = valid()
         if result >= max_acc:
             max_acc = result
             torch.save(model.state_dict(),
-                       f'/home/zhr/JDNER/outputs/{MODEL_NAME}_v{VER}_{max_acc}.pt')
+                       f'/home/zbg/Reinforcement/强化学习算法2021/JDNER/outputs/{MODEL_NAME}_v{VER}_{max_acc}.pt')
         gc.collect()
 
-else:
-    model.load_state_dict(torch.load(f'{LOAD_MODEL_FROM}/bert_base_chinese_v1_0.25288123172571325.pt'))
-    print('Model loaded.')
-    # valid()
-
-
 ##################################################################################
+'''
 test_set = dataset(torch.load('./datasets/JDNER/test'))
 test_dataloader = DataLoader(test_set, **test_params, collate_fn=collate)
+
+
 # 推理
 def decode_ent(text, pred_matrix, threshold=0):
     # print(text)
@@ -595,7 +692,9 @@ def predict():
         for batch in tqdm(test_dataloader):
             ids = batch[0].to(config['device'], dtype=torch.long)
             mask = batch[1].to(config['device'], dtype=torch.long)
-            tr_logits = model(ids, mask)
+            seg = batch[3].to(config['device'], dtype=torch.long)
+
+            tr_logits = model(ids, mask, seg)
             preds = tr_logits.detach().cpu().numpy()
             for i in range(len(preds)):
                 labels = decode_ent(test_text[tmp]['words'], preds[i])
@@ -621,3 +720,4 @@ def predict():
 
 
 predict()
+'''
