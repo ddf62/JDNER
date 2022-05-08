@@ -14,12 +14,15 @@ from sklearn.metrics import accuracy_score
 from torch.utils.data import DataLoader, Dataset
 from torch import kl_div, nn
 from tqdm import tqdm
-from transformers import AutoModelForMaskedLM, AutoTokenizer, AutoModel, get_polynomial_decay_schedule_with_warmup, \
-    AutoConfig
+from transformers import AutoModelForMaskedLM, AutoTokenizer, AutoModel, BertTokenizer, \
+    get_polynomial_decay_schedule_with_warmup, AutoConfig
 from torch import cuda
+from model.configuration_nezha import NeZhaConfig
 from tools.utils import FGM, ConditionalLayerNorm
+from model.modeling_nezha import NeZhaModel
+from model.configuration_nezha import NeZhaConfig
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # 0,1,2,3 for four gpu
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # 0,1,2,3 for four gpu
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 start_time = time.localtime(time.time())
 start_time_str = f'{start_time[1]}-{start_time[2]}-{start_time[3]}:{start_time[4]}'
@@ -33,11 +36,11 @@ LOAD_DATA_FROM = None
 # IF FOLLOWING IS NONE, THEN NOTEBOOK
 # USES INTERNET AND DOWNLOADS HUGGINGFACE
 # CONFIG, TOKENIZER, AND MODEL
-DOWNLOADED_MODEL_PATH = './prev_trained_model/uer-large-token'
+DOWNLOADED_MODEL_PATH = './prev_trained_model/nezha-mlm-0.4'
 
 if DOWNLOADED_MODEL_PATH is None:
     DOWNLOADED_MODEL_PATH = 'model'
-MODEL_NAME = 'uer-large-token-block-token_fgm-dropout-wei-B'
+MODEL_NAME = 'nazha-mlm-0.4-token-block-fgm-dropout-wei-all'
 log_format = logging.Formatter(fmt='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                                datefmt='%m/%d/%Y %H:%M:%S')
 logger = logging.getLogger()
@@ -68,7 +71,7 @@ config = {'model_name': MODEL_NAME,
           'max_grad_norm': 10,
           'norm': 1,
           'T_max': 2,
-          'thread': 0.819,
+          'thread': 0.82,
           'device': 'cuda' if cuda.is_available() else 'cpu'}
 logger.info(config)
 # THIS WILL COMPUTE VAL SCORE DURING COMMIT BUT NOT DURING SUBMIT
@@ -206,7 +209,7 @@ def preprocessor(df, tokenizer):
     return df
 
 
-tokenizer = AutoTokenizer.from_pretrained(DOWNLOADED_MODEL_PATH, do_lower_case=True)
+tokenizer = BertTokenizer.from_pretrained(DOWNLOADED_MODEL_PATH, do_lower_case=True)
 tokenizer.add_tokens(' ')
 #########################################################################
 # 定义dataset
@@ -274,7 +277,7 @@ if LOAD_DATA_FROM is None:
     # 读取训练文件
 
     print('preprocess train')
-    train_text = read_text('./datasets/JDNER/train_wei_pro_plus_max_+++.txt')
+    train_text = read_text('./datasets/JDNER/train_wei.txt')
     train_df = preprocessor(train_text, tokenizer)
     train_set = dataset(train_df)
     print("TRAIN Dataset: {}".format(len(train_df)))
@@ -323,8 +326,9 @@ def add_mask_tril(logits, mask):
 class GlobalPointer(nn.Module):
     def __init__(self, model_path, ent_type_size, inner_dim, hidden_size=1024):
         super().__init__()
-
-        self.model = AutoModelForMaskedLM.from_pretrained(model_path)
+        configs = NeZhaConfig.from_pretrained(model_path)
+        self.model = NeZhaModel.from_pretrained(model_path, config=configs)
+        # self.model = AutoModel.from_pretrained(model_path)
         self.ent_type_size = ent_type_size
         self.inner_dim = inner_dim
         self.hidden_size = hidden_size
@@ -363,11 +367,11 @@ class GlobalPointer(nn.Module):
             input_ids,
             attention_mask=attention_mask,
             token_type_ids=seg,
-            return_dict=True,
-            output_hidden_states=True
-        ).hidden_states
+            # return_dict=True,
+            # output_hidden_states=True
+        )  # .hidden_states
 
-        last_hidden_state = outputs[-1]
+        last_hidden_state = outputs[0]
         batch_size = last_hidden_state.size()[0]
         seq_len = last_hidden_state.size()[1]
 
@@ -406,18 +410,14 @@ class GlobalPointer(nn.Module):
         return logits / self.inner_dim ** 0.5
 
 
-model = GlobalPointer(model_path=DOWNLOADED_MODEL_PATH, ent_type_size=len(output_labels), inner_dim=64,
-                      hidden_size=1024)
-model.model.resize_token_embeddings(len(tokenizer))
+model = GlobalPointer(model_path=DOWNLOADED_MODEL_PATH, ent_type_size=len(output_labels), inner_dim=64, hidden_size=768)
+# model.model.resize_token_embeddings(len(tokenizer))
 optimizer = torch.optim.AdamW([{'params': model.model.parameters(), 'lr': config['learning_rate_for_bert'],
                                 "weight_decay": config['weight_decay']},
                                {'params': model.dense.parameters(), 'lr': config['learning_rate_for_others'],
                                 "weight_decay": 0.0}],
                               eps=1e-6,
                               )
-num_batches = len(train_dataloader) / config['train_batch_size']
-total_train_steps = int(num_batches * config['epochs'])
-warmup_steps = int(0.2 * total_train_steps)
 '''
 sched = get_polynomial_decay_schedule_with_warmup(optimizer,
                                                   num_warmup_steps=warmup_steps,
@@ -432,9 +432,9 @@ sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer,
 
 fgm = FGM(model)
 model.to(config['device'])
-kl_div = nn.KLDivLoss(reduction='batchmean')
 
 
+# kl_div = nn.KLDivLoss(reduction='batchmean')
 # model.load_state_dict(torch.load('outputs/uer_large_token_v1_0.8117350654732964.pt'))
 
 def get_evaluate_fpr(y_pred, y_true):
@@ -530,7 +530,8 @@ def train():
                 parameters=model.parameters(), max_norm=config['max_grad_norm']
             )
 
-            fgm.attack(epsilon=config['epsilon'], emb_name='bert.embeddings.word_embeddings.weight')
+            # fgm.attack(epsilon=config['epsilon'], emb_name='bert.embeddings.word_embeddings.weight')
+            fgm.attack(epsilon=config['epsilon'], emb_name='model.embeddings.word_embeddings.weight')
             logits_adv = model(ids, mask, seg)
             loss_adv = loss_fun(labels, logits_adv)
             loss_adv.backward()  # 反向传播，并在正常的grad基础上，累加对抗训练的梯度
@@ -538,8 +539,8 @@ def train():
                 parameters=model.parameters(), max_norm=config['max_grad_norm']
             )
 
-            fgm.restore(emb_name='bert.embeddings.word_embeddings.weight')
-
+            # fgm.restore(emb_name='bert.embeddings.word_embeddings.weight')
+            fgm.restore(emb_name='model.embeddings.word_embeddings.weight')
             optimizer.step()
             sched.step()
             optimizer.zero_grad()
@@ -640,7 +641,7 @@ def valid_dev():
 
 
 if not LOAD_MODEL_FROM:
-    max_acc = 0.817
+    max_acc = 0.82
     for epoch in range(config['epochs']):
 
         logger.info(f"### Training epoch: {epoch + 1}")
@@ -656,68 +657,3 @@ if not LOAD_MODEL_FROM:
         gc.collect()
 
 ##################################################################################
-'''
-test_set = dataset(torch.load('./datasets/JDNER/test'))
-test_dataloader = DataLoader(test_set, **test_params, collate_fn=collate)
-
-
-# 推理
-def decode_ent(text, pred_matrix, threshold=0):
-    # print(text)
-    ent_list = {}
-    length = len(text)
-    for ent_type_id, token_start_index, toekn_end_index in zip(*np.where(pred_matrix > threshold)):
-        ent_type = ids_to_labels[ent_type_id]
-        ent_char_span = [token_start_index - 1, toekn_end_index - 1]
-
-        if ent_char_span[0] >= length + 1:
-            continue
-        if ent_char_span[0] == -1:
-            ent_char_span[0] = 0
-        if ent_char_span[1] >= length + 1:
-            ent_char_span[1] = length - 1
-
-        ent_type_dict = ent_list.get(ent_type, [])
-        ent_type_dict.append(ent_char_span)
-        ent_list.update({ent_type: ent_type_dict})
-    # print(ent_list)
-    return ent_list
-
-
-def predict():
-    test_text = read_test_text('./datasets/JDNER/test.txt')
-    fp = open('test_prediction.txt', 'w')
-    tmp = 0
-    with torch.no_grad():
-        for batch in tqdm(test_dataloader):
-            ids = batch[0].to(config['device'], dtype=torch.long)
-            mask = batch[1].to(config['device'], dtype=torch.long)
-            seg = batch[3].to(config['device'], dtype=torch.long)
-
-            tr_logits = model(ids, mask, seg)
-            preds = tr_logits.detach().cpu().numpy()
-            for i in range(len(preds)):
-                labels = decode_ent(test_text[tmp]['words'], preds[i])
-                index = 0
-                for key in labels.keys():
-                    for span in labels[key]:
-                        for index in range(span[0], span[1] + 1):
-                            if key == 'O':
-                                test_text[tmp]['words'][index] = test_text[tmp]['words'][index] + ' ' + 'I-' + key
-                            else:
-                                test_text[tmp]['words'][index] = test_text[tmp]['words'][index] + ' ' + 'I-' + key
-                        if key != 'O':
-                            test_text[tmp]['words'][span[0]] = test_text[tmp]['words'][span[0]] + ' ' + 'B-' + key
-
-                for jk in range(len(test_text[tmp]['words'])):
-                    if len(test_text[tmp]['words'][jk].split(' ')) == 1 or test_text[tmp]['words'][jk] == ' ':
-                        fp.write(test_text[tmp]['words'][jk] + ' O\n')
-                    else:
-                        fp.write(test_text[tmp]['words'][jk] + '\n')
-                fp.write('\n')
-                tmp += 1
-    fp.close()
-
-
-predict()
-'''
