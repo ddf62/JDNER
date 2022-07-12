@@ -1,34 +1,62 @@
-# JDNER, 第一，第一，还是他妈的第一
-### 数据分析：https://docs.qq.com/sheet/DQ2J0cWlKVVNsS2pt
+# 代码说明
 
-###问题
-1. 组成句子再分词，会存在实体丢失的问题。
-2. 
-|       | 模型                                                    | dev                           | test     | 干啥了                                                                                             |
-|-------|-------------------------------------------------------|-------------------------------|----------|-------------------------------------------------------------------------------------------------|
-| 03-22 | baseline                                              | 0.7885                        | 0.785504 | baseline                                                                                        |
-| 03-22 | baseline-1                                            | 0.7823                        | 0.78604  | 调低了学习率，增大了epoch                                                                                 |
-| 03-23 | baseline-roberta                                      | 0.7890(3150)                  | 0.7854   | bert to roberta                                                                                 |
-| 03-23 | roberta-v1                                            | 0.7884（4275）                  | 0.7843   | 连接后四层                                                                                           |
-| 03-28 | bert-base-globalpointer(zhr-李老师服务器)                   | 0.7911                        | 0.75982  | 使用了 [源码](https://github.com/gaohongkui/GlobalPointer_pytorch) ,在处理数据时，删去了空格,且为整句tokenize        |
-| 03-28 | bert-base-globalpointer（zhr-nlp服务器）                   | 0.7487                        |          | 使用了重写版本，将大写英文全部改为小写，保留空格，并在bert字典里添加了空格                                                         |
-| 03-28 | bert-base-globalpointer（广哥服务器）                        | 0.682338                      |          | 较上一个版本添加了dropout，修改warmup为get_polynomial_decay_schedule_with_warmup(30个epoch，但是过拟合还不严重）         |
-| 03-28 | ernie-2.0-globalpointer(zhr-nlp服务器)                   |                               |          | 依然使用cos_warmup,添加dropout，rate为0.22                                                              |
-| 03-28 | globalpointer-baseline(广哥服务器）                         | 0.8452097116704104(在后4000上验证） | 0.80266  | 用了讨论区[baseline](https://github.com/DataArk/GAIIC2022-Product-Title-Entity-Recognition-Baseline) |
-| 03-28 | chinese-bert-wwm-globalpointer(zhr-nlp服务器)            | 0.75619                       |          | 使用重写版本cos warmup，dropout率为0.22，但30个epoch还未收敛                                                    |
-| 03-29 | ernie1.0-globalpointer(zhr-nlp服务器)                    | 0.7589031699347775            |          | 设置同上                                                                                            |
-| 03-29 | ernie1.0-globalpointer-baseline(广哥服务器)                | 0.8241530740276035            |          | 把讨论区baseline模型换成ernie1.0(5个epoch)                                                               |
-| 03-29 | chinese-roberta-wwm-ext-globalpointer-baseline(广哥服务器) | 0.841652                      | 0.801785 | 同上                                                                                              |
-| 03-29 | chinese-bert-wwm-globalpointer-baseline(广哥服务器)        | 0.8036865                     | 0.79859  | 讨论区版，train和dev集换成我们划的                                                                           |
-| 03-29 | bert-base-chinese-globalpointer-seq                   | 0.70504                       |          | 将单个字合并成一个序列进行tokenize,10个epoch，调整实体映射方法                                                         |
-| 03-30 | bert-base-chinese-globalpointer                       |                               |          | 同03-28-2，去掉warmup                                                                               |
-| 03-30 | bert-base-globalpointer-baseline                      | 0.86766                       | 0.8012   | bert-wwm换成bert-base                                                                             |
+## 环境配置
+
+训练所使用平台为$python==3.7$，$pytorch==1.11.0$，$cudatoolkit==11.3$，3090显卡。
+初始化环境：
+
+```
+sh init.sh
+```
+
+其中pytorch安装后，可能会出现与显卡驱动不匹配的问题需要手动解决，输入：
+
+```
+conda install pytorch torchvision torchaudio cudatoolkit=11.3 -c pytorch
+```
+
+## 数据
+
+使用了大赛提供的4w训练集和100w无标签数据
+
+## 预训练模型
+
+使用了uer-large预训练模型，可以通过https://huggingface.co/junnyu/uer_large 获得，存放在data/pratrain_model中的uer-large-prev-10为经过10轮预训练后得到的模型结果。
+
+## 算法
+
+模型上游使用uer-large生成高质量的word embedding，再将word embedding输入到global pointer中生成标签。
+
+### 整体思路介绍
+
+1. 利用100w无标签数据对nezha-base进行mlm任务预训练
+2. 利用4w标签数据训练3-4个模型，对test集进行预测，生成伪标签
+3. 将1w伪标签和4w标签数据混和在一起，在第一步得到的预训练结果上进行微调
+
+### 网络结构
+
+![img.png](img.png)
+
+### 损失函数
+
+  $\log \left(1+\sum_{i \in \Omega_{n e g}} e^{s_{i}}\right)+\log \left(1+\sum_{j \in \Omega_{p o s}} e^{-s_{j}}\right)$  
+
+$s_i$为属于当前类别实体的得分，$s_j$为不属于当前类别实体的得分。
+
+### 数据增广
+
+利用4w标签数据训练3-4个模型，从100w无标签数据中随机抽取1w数据生成伪标签，加入到训练集中
+
+## 训练流程
+
+这里只给出了在10轮mlm预训练后得到的nezha-mlm上进行微调训练的过程，使用的训练数据为4w的标注数据和1w的伪标签。  
+启动训练：
+```
+conda activate pyt
+python ./code/pretrain_uer-large.py
+```
 
 
-##03-31 重大突破 GlobalPointer改对了
-|       | 模型                          | dev      | test      | 做啥了                                       |
-|-------|-----------------------------|----------|-----------|-------------------------------------------|
-| 03-31 | uer-large-globalponter-seq  | 0.805381 | 0.80187   | 新版seq globalpointer，没有warmup，用AutoModel加载 |
-| 04-01 | uer-large-globalpointer-seq | 0.81407 | 0.807206  | 用了cos的warm up |
- | 04-01 | uer-large-globalpointer-seq | 0.810139 |           | 将后四层连接，修改warmup为get_polynomial_decay_schedule_with_warmup|
- | 04-01 | uer-large-globalpointer-seq | 0.85553 |  0.80616  | 用了所有的训练集。warmup同上|                  
+## 其他注意事项
+
+前期训练阶段将官方给出的4w标注训练集划分为train和dev集，划分比例为9：1，选取的划分随机种子为42。
