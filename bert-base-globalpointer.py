@@ -1,6 +1,7 @@
 import copy
 import gc
 import logging
+from operator import length_hint
 import os
 
 # DECLARE HOW MANY GPUS YOU WISH TO USE.
@@ -12,17 +13,17 @@ import pandas as pd
 import torch
 from sklearn.metrics import accuracy_score
 from torch.utils.data import DataLoader, Dataset
-from torch import kl_div, nn
+from torch import _pack_padded_sequence, kl_div, nn
 from tqdm import tqdm
 from transformers import AutoModelForMaskedLM, AutoTokenizer, AutoModel, BertTokenizer, \
     get_polynomial_decay_schedule_with_warmup, AutoConfig
 from torch import cuda
 from model.configuration_nezha import NeZhaConfig
-from tools.utils import FGM, ConditionalLayerNorm
+from tools.utils import FGM, ConditionalLayerNorm, PGD
 from model.modeling_nezha import NeZhaModel
 from model.configuration_nezha import NeZhaConfig
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # 0,1,2,3 for four gpu
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # 0,1,2,3 for four gpu
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 start_time = time.localtime(time.time())
 start_time_str = f'{start_time[1]}-{start_time[2]}-{start_time[3]}:{start_time[4]}'
@@ -36,11 +37,11 @@ LOAD_DATA_FROM = None
 # IF FOLLOWING IS NONE, THEN NOTEBOOK
 # USES INTERNET AND DOWNLOADS HUGGINGFACE
 # CONFIG, TOKENIZER, AND MODEL
-DOWNLOADED_MODEL_PATH = './prev_trained_model/nezha-mlm-0.4'
+DOWNLOADED_MODEL_PATH = 'prev_trained_model/nezha-mlm-0.4'#'hfl/chinese-roberta-wwm-ext'# 'bert-base-chinese'
 
 if DOWNLOADED_MODEL_PATH is None:
     DOWNLOADED_MODEL_PATH = 'model'
-MODEL_NAME = 'nazha-mlm-0.4-token-block-fgm-dropout-wei-all'
+MODEL_NAME = 'nezha-mlm-0.4-7epoch-persudo0520-pgd-all'
 log_format = logging.Formatter(fmt='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                                datefmt='%m/%d/%Y %H:%M:%S')
 logger = logging.getLogger()
@@ -63,15 +64,15 @@ config = {'model_name': MODEL_NAME,
           'max_length': 256,
           'train_batch_size': 32,
           'valid_batch_size': 64,
-          'epochs': 8,
+          'epochs': 16,
           'learning_rate_for_bert': 5e-5,
           'learning_rate_for_others': 2e-3,
           'weight_decay': 1e-6,
-          'epsilon': 0.5,
+          'epsilon': 0.4,
           'max_grad_norm': 10,
           'norm': 1,
           'T_max': 2,
-          'thread': 0.82,
+          'thread': 0.84,
           'device': 'cuda' if cuda.is_available() else 'cpu'}
 logger.info(config)
 # THIS WILL COMPUTE VAL SCORE DURING COMMIT BUT NOT DURING SUBMIT
@@ -277,7 +278,7 @@ if LOAD_DATA_FROM is None:
     # 读取训练文件
 
     print('preprocess train')
-    train_text = read_text('./datasets/JDNER/train_wei.txt')
+    train_text = read_text('./datasets/JDNER/train.txt')  + read_text('./datasets/JDNER/presudo_7epoch-0520.txt') + read_text('./datasets/JDNER/dev.txt')
     train_df = preprocessor(train_text, tokenizer)
     train_set = dataset(train_df)
     print("TRAIN Dataset: {}".format(len(train_df)))
@@ -324,9 +325,9 @@ def add_mask_tril(logits, mask):
 
 
 class GlobalPointer(nn.Module):
-    def __init__(self, model_path, ent_type_size, inner_dim, hidden_size=1024):
+    def __init__(self, model_path, ent_type_size, inner_dim, hidden_size=1024, hidden_dim=256):
         super().__init__()
-        configs = NeZhaConfig.from_pretrained(model_path)
+        configs = NeZhaConfig.from_pretrained(model_path, output_hidden_states=True)
         self.model = NeZhaModel.from_pretrained(model_path, config=configs)
         # self.model = AutoModel.from_pretrained(model_path)
         self.ent_type_size = ent_type_size
@@ -336,8 +337,10 @@ class GlobalPointer(nn.Module):
 
         self.dense = nn.Sequential(
             nn.Dropout(p=0.5),
-            nn.Linear(self.hidden_size, self.ent_type_size * self.inner_dim * 2)
+            nn.Linear(hidden_size, self.ent_type_size * self.inner_dim * 2)
         )
+
+        # self.lstm = torch.nn.LSTM(hidden_size, hidden_dim, 2, batch_first=True, bidirectional=True)
 
         # self.type_embedding = nn.Embedding(len(output_labels), 256)
         # self.condition = ConditionalLayerNorm(1024, 256, eps=1e-12)
@@ -362,18 +365,26 @@ class GlobalPointer(nn.Module):
             return embeddings.to(inputs.device)
         return embeddings
 
-    def forward(self, input_ids, attention_mask, seg):
+    def forward(self, input_ids, attention_mask, seg, train_=False):
         outputs = self.model(
             input_ids,
             attention_mask=attention_mask,
             token_type_ids=seg,
             # return_dict=True,
             # output_hidden_states=True
-        )  # .hidden_states
-
-        last_hidden_state = outputs[0]
+        )#.hidden_states
+        if train_==True:
+            last_hidden_state = torch.cat([outputs[2][i] for i in [-1,-2,-3,4]], dim=0)
+            attention_mask = torch.cat([attention_mask for i in range(4)], dim=0)
+        else:
+            last_hidden_state = outputs[0]
         batch_size = last_hidden_state.size()[0]
         seq_len = last_hidden_state.size()[1]
+
+        # length = torch.sum(attention_mask, dim=-1).clone().detach().cpu().int()
+        # packed = nn.utils.rnn.pack_padded_sequence(last_hidden_state, length, batch_first=True, enforce_sorted=False)
+        # lstm_out, _ = self.lstm(packed)
+        # lstm_out, _ = nn.utils.rnn.pad_packed_sequence(lstm_out, batch_first=True)
 
         inputs = self.dense(last_hidden_state)
         inputs = torch.split(inputs, self.inner_dim * 2, dim=-1)
@@ -415,7 +426,10 @@ model = GlobalPointer(model_path=DOWNLOADED_MODEL_PATH, ent_type_size=len(output
 optimizer = torch.optim.AdamW([{'params': model.model.parameters(), 'lr': config['learning_rate_for_bert'],
                                 "weight_decay": config['weight_decay']},
                                {'params': model.dense.parameters(), 'lr': config['learning_rate_for_others'],
-                                "weight_decay": 0.0}],
+                                "weight_decay": 0.0},
+                                # {'params': model.lstm.parameters(), 'lr': config['learning_rate_for_others'],
+                                # "weight_decay": 0.0}
+                                ],
                               eps=1e-6,
                               )
 '''
@@ -431,6 +445,7 @@ sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer,
                                                              config['T_max'])
 
 fgm = FGM(model)
+pgd = PGD(model, emb_name='model.embeddings.word_embeddings.weight')
 model.to(config['device'])
 
 
@@ -498,14 +513,16 @@ def train():
     model.train()
     n = 0
     global global_step
+    K = 3
     with tqdm(total=len(train_dataloader), desc="Train") as pbar:
         for idx, batch in enumerate(train_dataloader):
             ids = batch[0].to(config['device'], dtype=torch.long)
             mask = batch[1].to(config['device'], dtype=torch.long)
             labels = batch[2].to(config['device'], dtype=torch.long)
+            labels = torch.cat([labels for i in range(4)], dim=0)
             seg = batch[3].to(config['device'], dtype=torch.long)
 
-            tr_logits = model(ids, mask, seg)
+            tr_logits = model(ids, mask, seg, train_=True)
             loss = loss_fun(labels, tr_logits)
             tr_loss += loss.item()
             # r-drop
@@ -526,34 +543,48 @@ def train():
             # backward pass
 
             loss.backward()
+            # torch.nn.utils.clip_grad_norm_(
+            #     parameters=model.parameters(), max_norm=config['max_grad_norm']
+            # )
+
+            # fgm
+            # # fgm.attack(epsilon=config['epsilon'], emb_name='bert.embeddings.word_embeddings.weight')
+            # fgm.attack(epsilon=config['epsilon'], emb_name='model.embeddings.word_embeddings.weight')
+            # logits_adv = model(ids, mask, seg, train_=True)
+            # loss_adv = loss_fun(labels, logits_adv)
+            # loss_adv.backward()  # 反向传播，并在正常的grad基础上，累加对抗训练的梯度
+            # # fgm.restore(emb_name='bert.embeddings.word_embeddings.weight')
+            # fgm.restore(emb_name='model.embeddings.word_embeddings.weight')
+
+            # pgd
+            pgd.backup_grad()
+            for t in range(K):
+                pgd.attack(is_first_attack=(t==0)) # 在embedding上添加对抗扰动, first attack时备份param.data
+                if t != K-1:
+                    model.zero_grad()
+                else:
+                    pgd.restore_grad()
+                logits_adv = model(ids, mask, seg, train_=True)
+                loss_adv = loss_fun(labels, logits_adv)
+                loss_adv.backward() # 反向传播，并在正常的grad基础上，累加对抗训练的梯度
+            pgd.restore() # 恢复embedding参数
+
             torch.nn.utils.clip_grad_norm_(
                 parameters=model.parameters(), max_norm=config['max_grad_norm']
             )
-
-            # fgm.attack(epsilon=config['epsilon'], emb_name='bert.embeddings.word_embeddings.weight')
-            fgm.attack(epsilon=config['epsilon'], emb_name='model.embeddings.word_embeddings.weight')
-            logits_adv = model(ids, mask, seg)
-            loss_adv = loss_fun(labels, logits_adv)
-            loss_adv.backward()  # 反向传播，并在正常的grad基础上，累加对抗训练的梯度
-            torch.nn.utils.clip_grad_norm_(
-                parameters=model.parameters(), max_norm=config['max_grad_norm']
-            )
-
-            # fgm.restore(emb_name='bert.embeddings.word_embeddings.weight')
-            fgm.restore(emb_name='model.embeddings.word_embeddings.weight')
             optimizer.step()
             sched.step()
             optimizer.zero_grad()
             pbar.set_postfix({'loss': '{0:1.5f}'.format(tr_loss / nb_tr_steps)})
             pbar.update(1)
             global_step += 1
-            if global_step % 200 == 0:
-                logger.info(f'steps: {global_step}')
-                f1 = valid_dev()
-                if f1 > config['thread']:
-                    torch.save(model.state_dict(),
-                               f'/home/zbg/Reinforcement/强化学习算法2021/JDNER/outputs/{MODEL_NAME}_{global_step}_{f1}.pt')
-                model.train()
+            # if global_step % 600 == 0:
+            #     logger.info(f'steps: {global_step}')
+            #     f1 = valid_dev()
+            #     if f1 > config['thread']:
+            #         torch.save(model.state_dict(),
+            #                    f'/home/zbg/Reinforcement/强化学习算法2021/JDNER/outputs/{MODEL_NAME}_{global_step}_{f1}.pt')
+            #     model.train()
 
     epoch_loss = tr_loss / nb_tr_steps
     logger.info(f"Training loss epoch: {epoch_loss}")
@@ -641,7 +672,7 @@ def valid_dev():
 
 
 if not LOAD_MODEL_FROM:
-    max_acc = 0.82
+    max_acc = config['thread']
     for epoch in range(config['epochs']):
 
         logger.info(f"### Training epoch: {epoch + 1}")
