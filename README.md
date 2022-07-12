@@ -21,7 +21,7 @@ conda install pytorch torchvision torchaudio cudatoolkit=11.3 -c pytorch
 
 ## 预训练模型
 
-使用了uer-large预训练模型，可以通过https://huggingface.co/junnyu/uer_large 获得，存放在data/pratrain_model中的uer-large-prev-10为经过10轮预训练后得到的模型结果。
+使用了nezha-base预训练模型.
 
 ## 算法
 
