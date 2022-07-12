@@ -21,7 +21,7 @@ conda install pytorch torchvision torchaudio cudatoolkit=11.3 -c pytorch
 
 ## 预训练模型
 
-使用了nezha-base预训练模型.
+使用了nezha-base预训练模型.可以通过https://github.com/lonePatient/NeZha_Chinese_PyTorch 获得.
 
 ## 算法
 
