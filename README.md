@@ -1,4 +1,7 @@
+# [比赛链接](https://www.heywhale.com/org/gaiic2022/competition/area/620b34ed28270b0017b823ad/content)
 # 代码说明
+persuda.pt: 制作伪标签  
+pretrain_uer-large.py：对nezha进行进一步预训练代码  
 
 ## 环境配置
 
@@ -25,7 +28,7 @@ conda install pytorch torchvision torchaudio cudatoolkit=11.3 -c pytorch
 
 ## 算法
 
-模型上游使用uer-large生成高质量的word embedding，再将word embedding输入到global pointer中生成标签。
+模型上游使用nezha生成高质量的word embedding，再将word embedding输入到global pointer中生成标签。
 
 ### 整体思路介绍
 
@@ -53,9 +56,8 @@ $s_i$为属于当前类别实体的得分，$s_j$为不属于当前类别实体�
 启动训练：
 ```
 conda activate pyt
-python ./code/pretrain_uer-large.py
+sh train.sh
 ```
-
 
 ## 其他注意事项
 
