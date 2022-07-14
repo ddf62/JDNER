@@ -1,6 +1,6 @@
 # [比赛链接](https://www.heywhale.com/org/gaiic2022/competition/area/620b34ed28270b0017b823ad/content)
 # 代码说明
-persuda.pt: 制作伪标签  
+persuda.py: 制作伪标签  
 pretrain_uer-large.py：对nezha进行进一步预训练代码  
 
 ## 环境配置
