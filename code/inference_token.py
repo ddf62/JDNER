@@ -1,3 +1,4 @@
+import argparse
 import copy
 import gc
 import logging
@@ -18,7 +19,14 @@ from transformers import AutoModelForMaskedLM, AutoTokenizer, AutoModel, get_pol
     AutoConfig
 from torch import cuda
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"  # 0,1,2,3 for four gpu
+parser = argparse.ArgumentParser(description='test')
+
+parser.add_argument('--model_name_or_path', type=str, help='Load Model Path')
+parser.add_argument('--output_dir', type=str, help='Output Dir of Model')
+parser.add_argument('--data_dir', type=str, help='Load Data Dir')
+args = parser.parse_args()
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # 0,1,2,3 for four gpu
 
 start_time = time.localtime(time.time())
 start_time_str = f'{start_time[1]}-{start_time[2]}-{start_time[3]}:{start_time[4]}'
@@ -32,11 +40,11 @@ LOAD_DATA_FROM = None
 # IF FOLLOWING IS NONE, THEN NOTEBOOK
 # USES INTERNET AND DOWNLOADS HUGGINGFACE
 # CONFIG, TOKENIZER, AND MODEL
-DOWNLOADED_MODEL_PATH = './prev_trained_model/uer-large'
+DOWNLOADED_MODEL_PATH = f'{args.model_name_or_path}'
 
 if DOWNLOADED_MODEL_PATH is None:
-    DOWNLOADED_MODEL_PATH = 'model'
-MODEL_NAME = 'uer_large_token'
+    DOWNLOADED_MODEL_PATH = '../model'
+MODEL_NAME = 'nezha_token'
 log_format = logging.Formatter(fmt='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                                datefmt='%m/%d/%Y %H:%M:%S')
 logger = logging.getLogger()
@@ -349,9 +357,9 @@ class GlobalPointer(nn.Module):
 model = GlobalPointer(model_path=DOWNLOADED_MODEL_PATH, ent_type_size=len(output_labels), inner_dim=64)
 
 model.to(config['device'])
-model.load_state_dict(torch.load('outputs/uer_large_pretrained_token_v1_0.8127603412616385.pt'))
+model.load_state_dict(torch.load(pretrained_dict = torch.load(f'{args.data_dir}best_model/nezha.pt')))
 ##################################################################################
-test_text = read_test_text('./datasets/JDNER/test.txt')
+test_text = read_test_text(f'{args.data_dir}/contest_data/preliminary_test_b/word_per_line_preliminary_B.txt')
 test_df = preprocessor(test_text, tokenizer)
 test_set = dataset(test_df)
 test_dataloader = DataLoader(test_set, **test_params, collate_fn=collate)
@@ -373,8 +381,8 @@ def decode_ent(text, pred_matrix, threshold=0):
 
 
 def predict():
-    test_text = read_test_text('./datasets/JDNER/test.txt')
-    fp = open('test_prediction.txt', 'w')
+    test_text = read_test_text(f'{args.data_dir}/contest_data/preliminary_test_b/word_per_line_preliminary_B.txt')
+    fp = open(f'{args.data_dir}/submission/results.txt', 'w')
     tmp = 0
     model.eval()
     with torch.no_grad():

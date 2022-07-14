@@ -1,3 +1,4 @@
+import argparse
 import copy
 import gc
 import logging
@@ -23,6 +24,13 @@ from tools.utils import FGM, ConditionalLayerNorm, PGD
 from model.modeling_nezha import NeZhaModel
 from model.configuration_nezha import NeZhaConfig
 
+parser = argparse.ArgumentParser(description='test')
+
+parser.add_argument('--model_name_or_path', type=str, help='Load Model Path')
+parser.add_argument('--output_dir', type=str, help='Output Dir of Model')
+parser.add_argument('--data_dir', type=str, help='Load Data Dir')
+args = parser.parse_args()
+
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # 0,1,2,3 for four gpu
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 start_time = time.localtime(time.time())
@@ -37,18 +45,17 @@ LOAD_DATA_FROM = None
 # IF FOLLOWING IS NONE, THEN NOTEBOOK
 # USES INTERNET AND DOWNLOADS HUGGINGFACE
 # CONFIG, TOKENIZER, AND MODEL
-DOWNLOADED_MODEL_PATH = 'prev_trained_model/nezha-mlm-0.4'#'hfl/chinese-roberta-wwm-ext'# 'bert-base-chinese'
+DOWNLOADED_MODEL_PATH = f'{args.model_name_or_path}'#'hfl/chinese-roberta-wwm-ext'# 'bert-base-chinese'
 
 if DOWNLOADED_MODEL_PATH is None:
-    DOWNLOADED_MODEL_PATH = 'model'
-MODEL_NAME = 'nezha-mlm-0.4-7epoch-persudo0520-pgd-all'
+    DOWNLOADED_MODEL_PATH = '../model'
+MODEL_NAME = 'nezha-mlm-0.4'
 log_format = logging.Formatter(fmt='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                                datefmt='%m/%d/%Y %H:%M:%S')
 logger = logging.getLogger()
 
 if LOAD_MODEL_FROM is None:
-    logfile = './outputs/logs/' + MODEL_NAME + '_log_' + start_time_str + '.log'
-
+    logfile = f'{args.data_dir}/outputs/logs/' + MODEL_NAME + '_log_' + start_time_str + '.log'
     logging.basicConfig(level=logging.DEBUG)
     file_handler = logging.FileHandler(logfile)
     file_handler.setLevel(level=logging.INFO)
@@ -255,11 +262,6 @@ class Collate:
 
 
 #################################################################
-
-
-# train_set = dataset(train_df)
-# dev_set = dataset(dev_df)
-# test_set = dataset(test_df)
 # 生成dataloader
 train_params = {'batch_size': config['train_batch_size'],
                 'shuffle': True,
@@ -278,7 +280,7 @@ if LOAD_DATA_FROM is None:
     # 读取训练文件
 
     print('preprocess train')
-    train_text = read_text('./datasets/JDNER/train.txt')  + read_text('./datasets/JDNER/presudo_7epoch-0520.txt') + read_text('./datasets/JDNER/dev.txt')
+    train_text = read_text(f'{args.data_dir}/public_data/train.txt')
     train_df = preprocessor(train_text, tokenizer)
     train_set = dataset(train_df)
     print("TRAIN Dataset: {}".format(len(train_df)))
@@ -295,7 +297,6 @@ if LOAD_DATA_FROM is None:
 
 
 #########################################################################
-# 模型
 # 模型
 def sequence_masking(x, mask, value='-inf', axis=None):
     if mask is None:
@@ -339,9 +340,7 @@ class GlobalPointer(nn.Module):
             nn.Dropout(p=0.5),
             nn.Linear(hidden_size, self.ent_type_size * self.inner_dim * 2)
         )
-
         # self.lstm = torch.nn.LSTM(hidden_size, hidden_dim, 2, batch_first=True, bidirectional=True)
-
         # self.type_embedding = nn.Embedding(len(output_labels), 256)
         # self.condition = ConditionalLayerNorm(1024, 256, eps=1e-12)
 
@@ -373,13 +372,12 @@ class GlobalPointer(nn.Module):
             # return_dict=True,
             # output_hidden_states=True
         )#.hidden_states
-        if train_==True:
-            last_hidden_state = torch.cat([outputs[2][i] for i in [-1,-2,-3,4]], dim=0)
+
+        if train_:
+            last_hidden_state = torch.cat([outputs[2][i] for i in [-1, -2, -3, 4]], dim=0)
             attention_mask = torch.cat([attention_mask for i in range(4)], dim=0)
         else:
             last_hidden_state = outputs[0]
-        batch_size = last_hidden_state.size()[0]
-        seq_len = last_hidden_state.size()[1]
 
         # length = torch.sum(attention_mask, dim=-1).clone().detach().cpu().int()
         # packed = nn.utils.rnn.pack_padded_sequence(last_hidden_state, length, batch_first=True, enforce_sorted=False)
@@ -406,12 +404,6 @@ class GlobalPointer(nn.Module):
             kw = kw * cos_pos + kw2 * sin_pos
         # 计算内积
         logits = torch.einsum('bmhd , bnhd -> bhmn', qw, kw)
-        # 排除padding 排除下三角
-        # logits = add_mask_tril(logits, attention_mask)
-        # pad_mask = attention_mask.unsqueeze(1).unsqueeze(1).expand(batch_size, self.ent_type_size, seq_len, seq_len)
-        # pad_mask_h = attention_mask.unsqueeze(1).unsqueeze(-1).expand(batch_size, self.ent_type_size, seq_len, seq_len)
-        # pad_mask = pad_mask_v&pad_mask_h
-        # logits = logits * pad_mask - (1 - pad_mask) * 1e12
 
         # 排除下三角
         # mask = torch.tril(torch.ones_like(logits), -1)
@@ -432,19 +424,12 @@ optimizer = torch.optim.AdamW([{'params': model.model.parameters(), 'lr': config
                                 ],
                               eps=1e-6,
                               )
-'''
-sched = get_polynomial_decay_schedule_with_warmup(optimizer,
-                                                  num_warmup_steps=warmup_steps,
-                                                  num_training_steps=total_train_steps,
-                                                  lr_end=2e-5,
-                                                  power=2
-                                                  )
-'''
+
 sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer,
                                                              len(train_dataloader) * config['norm'],
                                                              config['T_max'])
 
-fgm = FGM(model)
+# fgm = FGM(model)
 pgd = PGD(model, emb_name='model.embeddings.word_embeddings.weight')
 model.to(config['device'])
 
@@ -684,7 +669,7 @@ if not LOAD_MODEL_FROM:
         if result >= max_acc:
             max_acc = result
             torch.save(model.state_dict(),
-                       f'/home/zbg/Reinforcement/强化学习算法2021/JDNER/outputs/{MODEL_NAME}_v{VER}_{max_acc}.pt')
+                       f'{args.output_dir}/{MODEL_NAME}_v{VER}_{epoch + 1}.pt')
         gc.collect()
 
 ##################################################################################
